@@ -1,0 +1,118 @@
+name: Azure Container Apps CI/CD
+
+pr:
+  branches:
+    include:
+      - master
+trigger:
+  branches:
+    include:
+      - master
+
+variables:
+  IMAGE_TAG: 'v1'                              # Change to v2 and push to trigger deploy
+  DOCKER_IMAGE: '03sarath/yolo-mlops'
+  CONTAINER_APP_NAME: 'ml-app'
+  RESOURCE_GROUP: 'ml-rg'
+  LOCATION: 'eastus'
+  ENVIRONMENT_NAME: 'ml-env'
+
+stages:
+- stage: Build
+  displayName: Build Stage
+  jobs:
+  - job: build_job
+    displayName: Build Job
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+      submodules: true
+
+    - script: |
+        echo "=========================================="
+        echo "  DEPLOYMENT SUMMARY"
+        echo "=========================================="
+        echo "  Image          : $(DOCKER_IMAGE)"
+        echo "  Tag            : $(IMAGE_TAG)"
+        echo "  Full Image     : docker.io/$(DOCKER_IMAGE):$(IMAGE_TAG)"
+        echo "  Target App     : $(CONTAINER_APP_NAME)"
+        echo "  Resource Group : $(RESOURCE_GROUP)"
+        echo "  Location       : $(LOCATION)"
+        echo "  Environment    : $(ENVIRONMENT_NAME)"
+        echo "=========================================="
+      displayName: Print Deployment Summary
+
+    - script: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed docker.io/$(DOCKER_IMAGE):$(IMAGE_TAG)
+      displayName: Trivy Security Scan
+
+- stage: ManualApprovalAfterBuild
+  displayName: Manual Approval After Build
+  dependsOn: Build
+  jobs:
+  - job: waitForValidation
+    displayName: Wait for external validation
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 5
+      inputs:
+        notifyUsers: |
+          sarath@psitrontech.com
+        instructions: 'Please validate the build configuration and resume'
+        onTimeout: 'resume'
+
+- stage: DeployToStaging
+  displayName: Deploy to Staging Stage
+  dependsOn: ManualApprovalAfterBuild
+  jobs:
+  - job: deploy_to_staging_job
+    displayName: Deploy to Staging Job
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: AzureCLI@2
+      displayName: Deploy Container App (Staging)
+      inputs:
+        azureSubscription: 'Azure-ARM-my-ai-cv'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az group create \
+            --name $(RESOURCE_GROUP) \
+            --location $(LOCATION) \
+            --output none
+
+          if ! az containerapp env show \
+                --name $(ENVIRONMENT_NAME) \
+                --resource-group $(RESOURCE_GROUP) \
+                --output none 2>/dev/null; then
+            az containerapp env create \
+              --name $(ENVIRONMENT_NAME) \
+              --resource-group $(RESOURCE_GROUP) \
+              --location $(LOCATION)
+          fi
+
+          STAGING_APP="$(CONTAINER_APP_NAME)-staging"
+
+          if az containerapp show \
+              --name $STAGING_APP \
+              --resource-group $(RESOURCE_GROUP) \
+              --output none 2>/dev/null; then
+            az containerapp update \
+              --name $STAGING_APP \
+              --resource-group $(RESOURCE_GROUP) \
+              --image docker.io/$(DOCKER_IMAGE):$(IMAGE_TAG)
+          else
+            az containerapp create \
+              --name $STAGING_APP \
+              --resource-group $(RESOURCE_GROUP) \
+              --environment $(ENVIRONMENT_NAME) \
+              --image docker.io/$(DOCKER_IMAGE):$(IMAGE_TAG) \
+              --target-port 80 \
+              --ingress external \
+              --cpu 0.5 \
+              --memory 1.0Gi
+          fi
